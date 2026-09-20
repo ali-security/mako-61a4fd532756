@@ -1,25 +1,34 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  # dispatch-only on the CI fork: the upstream `push` trigger is removed so the
+  # sync push does not start CI we did not ask for.
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector passed through to tox as posargs"
+        required: false
+        default: ""
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      # Registry time machine: resolve every pip install — tox and its test
+      # dependencies as well as the build tooling — to what existed on the
+      # 1.2.4 release date. Without it pygments' HTML output has drifted and
+      # test_exceptions' pygments assertions fail against the unpatched base.
+      # tox 3 forwards PIP_INDEX_URL into the test env by default.
+      PIP_INDEX_URL: "https://:2022-11-15@time-machines-pypi.sealsecurity.io/"
     strategy:
       # run this job using this matrix
       matrix:
         os:
-          - "ubuntu-latest"
+          # ubuntu-22.04 rather than ubuntu-latest: setup-python publishes no
+          # 3.7 build for ubuntu-24.04.
+          - "ubuntu-22.04"
           - "windows-latest"
           - "macos-latest"
         python-version:
@@ -33,25 +42,66 @@ jobs:
           # See https://github.com/bbangert/beaker/pull/213
           - os: "windows-latest"
             python-version: "3.10"
+          # CPython gained arm64-darwin support in 3.9.1, so there is no 3.7
+          # build for the arm64 macos-latest runner and no x64 macOS runner is
+          # available any more (macos-13 is retired). Building 3.7 from source
+          # there needs openssl@1.1, which Homebrew no longer carries. Only
+          # this one os x version row is dropped — 3.7 still runs on ubuntu
+          # and windows, and macOS still runs 3.8, 3.9 and 3.10.
+          - os: "macos-latest"
+            python-version: "3.7"
 
       fail-fast: false
 
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        # drop-in for actions/setup-python that also provisions old CPython on
+        # arm64 macos-latest, where the official version manifest has no
+        # 3.7/3.8/3.9 build.
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
-          architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade tox setuptools
+          # setuptools is pinned rather than `--upgrade`d: the runner image
+          # preinstalls a setuptools newer than the release-era `packaging`
+          # that tox pulls from the time machine, and that pair breaks tox's
+          # sdist step with `canonicalize_version() got an unexpected keyword
+          # argument 'strip_trailing_zero'`.
+          pip install --upgrade tox
+          pip install "setuptools==65.5.1"
           pip list
 
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.10'
+        # The 1.2.4 release metadata was not produced by a single setuptools:
+        # the sdist's PKG-INFO still carries `Platform: UNKNOWN` (dropped in
+        # setuptools 62), while the wheel's METADATA does not. Build each leg
+        # with the setuptools that reproduces it, and pin wheel to the 0.38.4
+        # that the released wheel names in its `Generator:` line.
+        run: |
+          rm -rf Mako.egg-info build dist
+          pip install "build" "setuptools==59.6.0" "wheel==0.38.4"
+          python -m build --sdist --no-isolation
+          pip install --force-reinstall "setuptools==65.5.1" "wheel==0.38.4"
+          python -m build --wheel --no-isolation
+          ls -l dist
+
+      - name: Upload distributions
+        if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
